@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SMTP edge for mailcow - receives SMTP on :25 and forwards over WireGuard to home :10025
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the instance + security group will live
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the instance (must have route to an Internet Gateway)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH keypair for the instance
+
+  AllowedSshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH (strongly recommend your IP/32)
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.nano, t3.micro, t3.small, t4g.nano, t4g.micro, t4g.small]
+    Description: Instance type (t3.micro is fine)
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Ubuntu 24.04 LTS AMI from SSM
+
+Resources:
+  SmtpEdgeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SMTP and WireGuard
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Inbound SMTP from the world
+        - IpProtocol: tcp
+          FromPort: 25
+          ToPort: 25
+          CidrIp: 0.0.0.0/0
+
+        # WireGuard (ideally restrict to home IP)
+        - IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIp: 0.0.0.0/0
+
+        # SSH (restrictable via parameter)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSshCidr
+
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  SmtpEdgeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SmtpEdgeSecurityGroup
+      Tags:
+        - Key: Name
+          Value: smtp-edge-mailcow
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 16
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard iptables-persistent
+
+          # Enable IP forwarding
+          sed -i 's/^#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
+          sysctl -w net.ipv4.ip_forward=1
+
+          # WireGuard config placeholder - fill out keys and peer info later.
+          cat >/etc/wireguard/wg0.conf <<'EOF'
+          [Interface]
+          Address = 10.99.0.1/24
+          ListenPort = 51820
+          PrivateKey = <CONTENTS OF aws.key>
+
+          # Enable routing + NAT
+          PostUp = sysctl -w net.ipv4.ip_forward=1
+          PostUp = iptables -t nat -A PREROUTING -i ens5 -p tcp --dport 25 -j DNAT --to 10.99.0.2:10025
+          PostUp = iptables -t nat -A POSTROUTING -o wg0 -p tcp -d 10.99.0.2 --dport 10025 -j MASQUERADE
+          PostUp = iptables -A FORWARD -p tcp -d 10.99.0.2 --dport 10025 -j ACCEPT
+          PostUp = iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+          PostDown = iptables -t nat -D PREROUTING -i ens5 -p tcp --dport 25 -j DNAT --to 10.99.0.2:10025
+          PostDown = iptables -t nat -D POSTROUTING -o wg0 -p tcp -d 10.99.0.2 --dport 10025 -j MASQUERADE
+          PostDown = iptables -D FORWARD -p tcp -d 10.99.0.2 --dport 10025 -j ACCEPT
+          PostDown = iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+          [Peer]
+          PublicKey = <CONTENTS OF home.pub>
+          AllowedIPs = 10.99.0.2/32
+          EOF
+
+          chmod 600 /etc/wireguard/wg0.conf
+          systemctl enable wg-quick@wg0
+
+  SmtpEdgeEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  SmtpEdgeEipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref SmtpEdgeInstance
+      AllocationId: !GetAtt SmtpEdgeEip.AllocationId
+
+Outputs:
+  ElasticIp:
+    Description: Elastic IP for mail.alexfricker.com
+    Value: !Ref SmtpEdgeEip
+
+  ElasticIpAllocationId:
+    Description: Allocation ID (handy for other stacks)
+    Value: !GetAtt SmtpEdgeEip.AllocationId
+
+  InstanceId:
+    Description: SMTP edge instance
+    Value: !Ref SmtpEdgeInstance
+
+  SecurityGroupId:
+    Description: Security group ID
+    Value: !Ref SmtpEdgeSecurityGroup
